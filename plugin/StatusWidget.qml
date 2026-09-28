@@ -27,6 +27,12 @@ BarWidget {
   readonly property bool shown: recorderState === "recording" || recorderState === "paused"
                                 || recorderState === "stopping"
                                 || recorderState === "transcribing"
+                                || recorderState === "summarizing"
+                                || recorderState === "summary_saved"
+                                || recorderState === "summary_failed"
+                                || recorderState === "processing_action"
+                                || recorderState === "action_done"
+                                || recorderState === "action_failed"
   readonly property color foreground: bar ? bar.barForeground : Color.foreground
   readonly property color recordColor: Color.urgent
 
@@ -58,7 +64,7 @@ BarWidget {
     if (!data || typeof data.state !== "string") return
 
     var wasShown = root.shown
-    root.recorderState = /^(off|idle|recording|paused|stopping|transcribing|done)$/.test(data.state) ? data.state : "off"
+    root.recorderState = /^(off|idle|recording|paused|stopping|transcribing|summarizing|summary_saved|summary_failed|processing_action|action_done|action_failed|done)$/.test(data.state) ? data.state : "off"
     root.elapsed = Math.max(0, Math.floor(Number(data.elapsed) || 0))
     root.progress = root.level(data.progress)
     root.title = typeof data.title === "string" ? data.title.slice(0, root.maxTitleLength) : ""
@@ -107,18 +113,22 @@ BarWidget {
       width: Style.space(7)
       height: width
       radius: width / 2
-      // Dimmed and still while paused.
+      // Dimmed and still while paused; accent color while summarizing.
       color: root.recorderState === "paused"
              ? Qt.rgba(root.recordColor.r, root.recordColor.g, root.recordColor.b, 0.4)
+             : root.recorderState === "summary_failed" || root.recorderState === "action_failed" ? root.recordColor
+             : root.recorderState === "summarizing" || root.recorderState === "summary_saved"
+               || root.recorderState === "processing_action" || root.recorderState === "action_done"
+             ? Color.accent
              : root.recordColor
       opacity: 1
 
       SequentialAnimation on opacity {
-        running: root.recorderState === "recording"
+        running: root.recorderState === "recording" || root.recorderState === "summarizing" || root.recorderState === "processing_action"
         loops: Animation.Infinite
         alwaysRunToEnd: true
-        NumberAnimation { to: 0.3; duration: 700; easing.type: Easing.InOutSine }
-        NumberAnimation { to: 1.0; duration: 700; easing.type: Easing.InOutSine }
+        NumberAnimation { to: root.recorderState === "summarizing" ? 0.5 : 0.3; duration: root.recorderState === "summarizing" ? 1000 : 700; easing.type: Easing.InOutSine }
+        NumberAnimation { to: 1.0; duration: root.recorderState === "summarizing" ? 1000 : 700; easing.type: Easing.InOutSine }
       }
     }
 
@@ -158,6 +168,12 @@ BarWidget {
       text: root.recorderState === "stopping" ? "saving…"
           : root.recorderState === "paused" ? "paused " + root.clock(root.elapsed)
           : root.recorderState === "transcribing" ? "transcribing " + Math.round(root.progress * 100) + "%"
+          : root.recorderState === "summarizing" ? (root.progress >= 0.7 ? "saving note…" : "summarizing " + root.clock(root.elapsed))
+          : root.recorderState === "summary_saved" ? "summary saved"
+          : root.recorderState === "summary_failed" ? "summary failed"
+          : root.recorderState === "processing_action" ? "running action " + root.clock(root.elapsed)
+          : root.recorderState === "action_done" ? "action complete"
+          : root.recorderState === "action_failed" ? "action failed"
           : root.clock(root.elapsed)
       color: root.foreground
       font.family: bar ? bar.fontFamily : Style.font.family
@@ -172,7 +188,14 @@ BarWidget {
     hoverEnabled: true
     cursorShape: Qt.PointingHandCursor
     onClicked: if (root.bar) root.bar.run("omarchy-meeting-recorder")
-    onEntered: if (root.bar) root.bar.showTooltip(root, root.title ? "Recording: " + root.title : "Recording a meeting")
+    onEntered: if (root.bar) root.bar.showTooltip(root,
+      root.recorderState === "summary_saved" ? "Summary saved to Obsidian: " + root.title
+      : root.recorderState === "summary_failed" ? "Summary failed. Open recorder for details: " + root.title
+      : root.recorderState === "summarizing" ? "Summarizing: " + root.title
+      : root.recorderState === "processing_action" ? "Running action: " + root.title
+      : root.recorderState === "action_done" ? "Action complete: " + root.title
+      : root.recorderState === "action_failed" ? "Action failed. Open recorder for details: " + root.title
+      : root.title ? "Recording: " + root.title : "Recording a meeting")
     onExited: if (root.bar) root.bar.hideTooltip(root)
   }
 }

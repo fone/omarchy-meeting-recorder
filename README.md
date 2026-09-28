@@ -1,8 +1,8 @@
-# Meeting Recorder
+# Meeting Recorder with opt-in Obsidian summaries
 
-A meeting recorder for [Omarchy](https://omarchy.org). It records your microphone and the computer audio as two tracks, and when you stop you get a transcript with speakers, chapters and a player. You can also drop in a recording you already have. Everything is transcribed on your own machine.
+This is [Adam Potter's fork](https://github.com/fone/omarchy-meeting-recorder) of [Jankees van Woezik's Meeting Recorder](https://github.com/jankeesvw/omarchy-meeting-recorder). The original records your microphone and computer audio, transcribes locally, and provides speakers, chapters and playback. It did not send transcripts to a cloud LLM for summarization by default. This fork adds an optional action that sends transcript **text** to an OpenAI-compatible model and saves a structured **summary, not the raw transcript**, in Obsidian. The summarization workflow was inspired by a separate Meeting Notes app; it is not part of the original recorder.
 
-No bot joins your call, and no audio leaves your computer. It works with any meeting app, because it simply listens to what your computer plays and what you say.
+No bot joins your call, and recording audio is not sent by the summary action. **If you choose Summarize to Obsidian, the full transcript text leaves your machine for the model provider you configured.** Local transcription itself does not require a model API. The separate Store transcript in Obsidian action still exports a full transcript if you explicitly choose it.
 
 ![The done screen in Tokyo Night: chapters on the left, the transcript on the right, a waveform player above it](screenshots/hero.webp)
 
@@ -10,25 +10,29 @@ Open the app, check that both meters move, and press **Start recording**. When y
 
 Built for Omarchy on Hyprland (GTK 4 and libadwaita, written in Rust).
 
-## Install
+## Install this fork
 
-Meeting Recorder is in the [Omarchy package repository](https://github.com/omacom/omarchy-pkgs):
+**The Omarchy package, upstream installer, and upstream releases do not contain this fork's summarization action.** To get the behavior described here, build this repository and configure the action. The complete setup, including model credentials and bar widget, is in **[Summarize to Obsidian: setup and troubleshooting](docs/obsidian-summary.md)**.
+
+```bash
+git clone https://github.com/fone/omarchy-meeting-recorder.git
+cd omarchy-meeting-recorder
+cargo build --release
+mkdir -p "$HOME/.local/bin"
+ln -s "$PWD/target/release/omarchy-meeting-recorder" "$HOME/.local/bin/omarchy-meeting-recorder"
+```
+
+Use `cargo build --release --no-default-features` if you need a CPU-only build. See [Build from source](#build-from-source) for desktop integration, model downloads, and platform dependencies. The action must be configured separately; building alone does not send meetings to an LLM.
+
+### Original recorder packages
+
+The following commands install **the original recorder**, not this fork. Use them only if you want the upstream version:
 
 ```bash
 yay -S omarchy-meeting-recorder
 ```
 
-For now it is in the edge channel, so this works if you run Omarchy's edge packages; everyone else gets it with the next Omarchy release. Until then, this one line builds the same pacman package from the [PKGBUILD](packaging/aur/PKGBUILD) in this repository ([install.sh](install.sh) is ten lines, read it first if you like):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/jankeesvw/omarchy-meeting-recorder/main/install.sh | bash
-```
-
-Either way `sudo pacman -R omarchy-meeting-recorder-bin` removes it again.
-
-Then open **Meeting Recorder** from the launcher. The first transcription downloads the whisper model (about 1.6 GB, once), and the app shows you how far along it is. It offers to put a live waveform in your bar the first time, and the package prints the Hyprland rules for a floating window (also [below](#build-from-source)).
-
-Prefer to build it yourself? See [Build from source](#build-from-source), or grab the binary from the [latest release](https://github.com/jankeesvw/omarchy-meeting-recorder/releases/latest).
+Upstream also offers its [installer](https://github.com/jankeesvw/omarchy-meeting-recorder/blob/main/install.sh) and [releases](https://github.com/jankeesvw/omarchy-meeting-recorder/releases). Do not install those over a source build and expect this fork's changes to survive. Open **Meeting Recorder** from the launcher after building; the first transcription downloads the whisper model (about 1.6 GB).
 
 <p align="center"><img src="screenshots/transcribing-animation.webp" alt="The transcribing animation: a neon sun over a scrolling grid, the progress bar and the lines as they are recognised, with the speakers' names" width="420"></p>
 
@@ -54,13 +58,13 @@ Press Ctrl+M, or the button in the header bar, and the window shrinks to a strip
 
 <p align="center"><img src="screenshots/compact.webp" alt="The compact strip: a red dot, the elapsed time, two small waves and an expand button" width="420"></p>
 
-The bar widget shows the same while you record: a pulsing dot, a small waveform with the mic above the line and the computer audio below it, and the time. Paused it says "paused 01:23", and while the meeting is transcribed it shows the progress. Clicking it brings the recorder window back.
+The bar widget shows the same while you record: a pulsing dot, a small waveform with the mic above the line and the computer audio below it, and the time. Paused it says "paused 01:23", while transcribing it shows progress, and during the opt-in summary action it shows elapsed time, followed by a saved/failed outcome. Clicking it brings the recorder window back.
 
 <p align="center"><img src="screenshots/bar-widget.webp" alt="The bar widget recording, paused and transcribing" width="600"></p>
 
 ### Transcribes on your own machine
 
-When you stop, the window switches straight to the transcribing animation: it saves the audio, then [whisper-rs](https://github.com/tazz4843/whisper-rs) transcribes the meeting, and the lines type themselves out with the speakers' names as they are recognised. It ends on 100% and DONE, and stays at least ten seconds, also for a short recording. Nothing is sent anywhere.
+When you stop, the window switches straight to the transcribing animation: it saves the audio, then [whisper-rs](https://github.com/tazz4843/whisper-rs) transcribes the meeting locally, and the lines type themselves out with the speakers' names as they are recognised. It ends on 100% and DONE, and stays at least ten seconds, also for a short recording. The transcript is not sent to the summary provider during this transcription step; the optional action is a separate click.
 
 <p align="center"><img src="screenshots/transcribing.webp" alt="The transcribing animation at 77 percent with lines from Maya and Tom" width="440"></p>
 
@@ -98,7 +102,7 @@ Chapters are an extra, not a requirement: without an agent the button is simply 
 
 ### Runs your own actions
 
-Put a few scripts of your own under **Actions** on the done page: store the transcript in your notes, publish it, mail it around. They go in `~/.config/omarchy-meeting-recorder/config.toml`, each with a name for the menu and a command. Until there is one, the button is **Add actions…** and explains how. See [Actions](#actions).
+Actions on the done page include this fork's bundled [Summarize to Obsidian](docs/obsidian-summary.md) script. Once configured, clicking it sends transcript text to your selected model provider, extracts decisions and action items, and saves a summary-only note. It does not run automatically. The original recorder's independent transcript-export and other example actions remain available. Actions live in `~/.config/omarchy-meeting-recorder/config.toml`; until you configure one, the button says **Add actions…**.
 
 ### Wears your Omarchy theme
 
@@ -171,11 +175,7 @@ The app looks for `ggml-<model>.bin`, for instance `ggml-large-v3-turbo.bin`, in
 
 ## Actions
 
-Your own scripts, picked from the **Actions** menu on the done page: store the transcript in Obsidian, publish it, mail it around. Each is a name and a command in `~/.config/omarchy-meeting-recorder/config.toml`; the command gets the meeting folder and the meeting's details, and what it prints last shows up in the app, with an **Open** button for a link.
-
-<p align="center"><img src="screenshots/actions-menu.webp" alt="Clicking Actions on the done page: the view zooms in on the menu with Store transcript in Obsidian and Publish as public transcript" width="700"></p>
-
-[docs/actions.md](docs/actions.md) explains it all, with two complete examples (Store transcript in Obsidian, and Publish as public transcript, where your default agent writes the summary) and a section for your agent, so you can ask it to write actions for you.
+Your own scripts are picked from **Actions** on the done page. This fork includes [Summarize to Obsidian](docs/obsidian-summary.md) as an optional, separately configured script. Other actions can store or publish full transcripts; only click those if you intend to share them. Each command gets the meeting folder and details, and its last printed line is shown in the app. [docs/actions.md](docs/actions.md) describes the action interface and the original examples.
 
 ## Testing
 
@@ -183,7 +183,7 @@ Your own scripts, picked from the **Actions** menu on the done page: store the t
 
 ## Privacy
 
-The audio, the transcript and everything else stay on your computer. The only thing that leaves it is the transcript text for the chapters, and only when you have set a default agent: it goes to that agent's service, the one you already chose and pay for. No agent, no chapters, nothing sent. Actions are yours: they send whatever your scripts send, and only when you pick one.
+The audio and transcript stay on your computer during recording and local transcription. If you configure a default coding agent, the original recorder can send transcript text to that agent for chapters. **Summarize to Obsidian** is a separate opt-in action: it sends the full transcript text to your chosen OpenAI-compatible endpoint, then writes only the structured summary to the local Obsidian vault. The raw transcript remains in the meeting folder. The original **Store transcript in Obsidian** or publication actions, if configured and clicked, have different disclosure behavior. Review the provider's data-retention terms before processing private meetings. Do not commit your API key, config file, recordings, or vault.
 
 ## Requirements
 
@@ -236,22 +236,17 @@ o.window("^com\\.jankeesvw\\.OmarchyMeetingRecorder$", { center = true })
 
 ### Bar widget
 
-The `plugin` directory is an Omarchy Quattro bar widget. It stays hidden until a recording starts. Installed as a package, the app offers to add it the first time you open it. From source, link it yourself:
+The `plugin` directory is an Omarchy Quattro bar widget. While the summary action runs, it shows a timer, then `summary saved` or `summary failed` for one minute. It also shows recording and transcription status. From this source build, **copy** it into the local plugin folder (do not symlink the folder: Omarchy validation rejects plugin symlinks):
 
 ```bash
-ln -s "$PWD/plugin" ~/.config/omarchy/plugins/jankeesvw.meeting-recorder
+mkdir -p "$HOME/.config/omarchy/plugins/jankeesvw.meeting-recorder"
+cp plugin/manifest.json plugin/StatusWidget.qml "$HOME/.config/omarchy/plugins/jankeesvw.meeting-recorder/"
+omarchy plugin validate "$HOME/.config/omarchy/plugins/jankeesvw.meeting-recorder"
 omarchy-shell shell rescanPlugins
-omarchy plugin enable jankeesvw.meeting-recorder
-omarchy bar move jankeesvw.meeting-recorder --section right
-```
-
-The shell discovers plugins asynchronously. If enabling immediately after a rescan says the plugin is not known, wait until `omarchy-shell shell listPlugins` includes `jankeesvw.meeting-recorder`, then run:
-
-```bash
 omarchy plugin enable jankeesvw.meeting-recorder --section right
 ```
 
-This also recovers a failed first-start “Add to Bar” attempt in version 1.0.2, which leaves the widget linked but does not offer again on restart.
+If the plugin was already installed, copy the two files again when updating this fork; `rescanPlugins` reloads it. The shell discovers plugins asynchronously. If enabling immediately after a rescan says it is not known, wait until `omarchy-shell shell listPlugins` includes `jankeesvw.meeting-recorder`, then retry the enable command. If it was already enabled, a rescan is sufficient. Do not copy any credential file into the plugin folder.
 
 ## Command line
 

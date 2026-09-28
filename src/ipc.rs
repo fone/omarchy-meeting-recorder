@@ -27,7 +27,8 @@ const MAX_LINE: usize = 4096;
 
 #[derive(Clone, Default)]
 pub struct Status {
-    /// idle, recording, paused, stopping, transcribing or done
+    /// idle, recording, paused, stopping, transcribing, summarizing,
+    /// processing_action, summary_saved/failed, action_done/failed, or done
     pub state: &'static str,
     pub started_at: i64,
     /// Seconds spent paused so far, and when the current pause began (0: not paused).
@@ -44,9 +45,10 @@ pub type Statuses = Arc<Mutex<Vec<SharedStatus>>>;
 /// How much a window's state matters to the bar: the one recording first.
 fn rank(state: &str) -> u8 {
     match state {
-        "recording" | "paused" => 4,
-        "stopping" => 3,
-        "transcribing" => 2,
+        "recording" | "paused" => 5,
+        "stopping" => 4,
+        "transcribing" | "summarizing" | "processing_action" => 3,
+        "summary_saved" | "summary_failed" | "action_done" | "action_failed" => 2,
         "done" => 1,
         _ => 0,
     }
@@ -66,7 +68,7 @@ pub fn busiest(statuses: &Statuses) -> Status {
         })
 }
 
-fn socket_path() -> PathBuf {
+pub fn socket_path() -> PathBuf {
     glib::user_runtime_dir().join(format!("{APP_NAME}.sock"))
 }
 
@@ -129,10 +131,16 @@ pub fn serve(
             } else {
                 now()
             };
-            let busy = recording || snapshot.state == "transcribing";
+            let busy = recording
+                || matches!(
+                    snapshot.state,
+                    "transcribing" | "summarizing" | "processing_action"
+                );
             let line = serde_json::json!({
                 "state": snapshot.state,
-                "elapsed": if taking { (until - snapshot.started_at - snapshot.paused_secs).max(0) } else { 0 },
+                "elapsed": if taking { (until - snapshot.started_at - snapshot.paused_secs).max(0) }
+                    else if matches!(snapshot.state, "summarizing" | "processing_action") { (now() - snapshot.started_at).max(0) }
+                    else { 0 },
                 "title": snapshot.title,
                 "mic": round(to_meter(mic.recent_peak(3))),
                 "computer": round(to_meter(system.recent_peak(3))),
@@ -248,5 +256,36 @@ mod tests {
             .unwrap()
             .push(status("recording", "Standup"));
         assert_eq!(busiest(&statuses).title, "Standup");
+    }
+
+    #[test]
+    fn action_statuses_rank_above_finished_meetings() {
+        for state in ["summarizing", "processing_action"] {
+            assert!(rank(state) > rank("done"), "{state} should win");
+        }
+        for state in [
+            "summary_saved",
+            "summary_failed",
+            "action_done",
+            "action_failed",
+        ] {
+            assert!(rank(state) > rank("done"), "{state} should remain visible");
+        }
+        let statuses = Statuses::default();
+        statuses.lock().unwrap().extend([
+            status("done", "Old meeting"),
+            status("summarizing", "Current meeting"),
+        ]);
+        assert_eq!(busiest(&statuses).title, "Current meeting");
+        statuses
+            .lock()
+            .unwrap()
+            .push(status("summary_saved", "Just saved"));
+        assert_eq!(busiest(&statuses).title, "Current meeting");
+        statuses
+            .lock()
+            .unwrap()
+            .retain(|s| s.lock().unwrap().state != "summarizing");
+        assert_eq!(busiest(&statuses).title, "Just saved");
     }
 }

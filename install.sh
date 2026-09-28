@@ -1,14 +1,9 @@
-#!/bin/bash
-# Installs Meeting Recorder as a pacman package, from the PKGBUILD in this repository.
-#   curl -fsSL https://raw.githubusercontent.com/jankeesvw/omarchy-meeting-recorder/main/install.sh | bash
-set -euo pipefail
-
-base=https://raw.githubusercontent.com/jankeesvw/omarchy-meeting-recorder/main/packaging/aur
-dir=$(mktemp -d)
-trap 'rm -rf "$dir"' EXIT
-cd "$dir"
-
-curl -fsSLO "$base/PKGBUILD"
-curl -fsSLO "$base/omarchy-meeting-recorder.install"
-# stdin is this script when it is piped in, so pacman's questions go to the terminal.
-makepkg -si --needed </dev/tty
+#!/bin/sh
+# This fork is distributed as source; the original project's AUR package
+# downloads upstream binaries and does not include the summary action.
+set -eu
+printf '%s\n' \
+  'This fork does not provide a prebuilt package installer.' \
+  'Build from source and configure the opt-in Obsidian action:' \
+  'https://github.com/fone/omarchy-meeting-recorder/blob/main/docs/obsidian-summary.md' >&2
+exit 1

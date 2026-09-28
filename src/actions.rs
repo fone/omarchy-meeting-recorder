@@ -110,7 +110,12 @@ pub struct Outcome {
 
 /// Runs `action` on the meeting in `dir`. Blocking; the caller runs it off the
 /// main thread.
-pub fn run(action: &Action, dir: &Path, manifest: &Manifest) -> Result<Outcome, String> {
+pub fn run(
+    action: &Action,
+    dir: &Path,
+    manifest: &Manifest,
+    progress_file: Option<&Path>,
+) -> Result<Outcome, String> {
     let date = gtk::glib::DateTime::from_unix_local(manifest.started_at)
         .and_then(|t| t.format("%Y-%m-%d %H:%M"))
         .map(|s| s.to_string())
@@ -138,6 +143,13 @@ pub fn run(action: &Action, dir: &Path, manifest: &Manifest) -> Result<Outcome, 
         .env("MEETING_LANGUAGE", &manifest.language)
         .env("MEETING_SPEAKERS", manifest.speakers.join("\n"))
         .env("MEETING_AUDIO", audio.unwrap_or_default())
+        .env("MEETING_SOCKET", crate::ipc::socket_path())
+        .env(
+            "MEETING_PROGRESS_FILE",
+            progress_file
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        )
         .stdin(Stdio::null())
         .output()
         .map_err(|e| e.to_string())?;
@@ -204,7 +216,7 @@ pub fn cli(args: &[String]) -> gtk::glib::ExitCode {
         eprintln!("No meeting in {meeting}");
         return ExitCode::FAILURE;
     };
-    match run(action, &dir, &manifest) {
+    match run(action, &dir, &manifest, None) {
         Ok(outcome) => {
             println!("{}", outcome.message);
             ExitCode::SUCCESS
@@ -311,6 +323,7 @@ name = "not an action"
             &action("echo busy; echo Saved obsidian://open?file=Weekly"),
             &dir,
             &manifest,
+            None,
         )
         .unwrap();
         assert_eq!(saved.message, "Saved");
@@ -319,11 +332,12 @@ name = "not an action"
             &action(r#"echo "$MEETING_TITLE by $(echo "$MEETING_SPEAKERS" | head -1)""#),
             &dir,
             &manifest,
+            None,
         )
         .unwrap();
         assert_eq!(named.message, "Weekly by Maya");
         assert!(named.url.is_none());
-        let failed = run(&action("echo nope >&2; exit 3"), &dir, &manifest);
+        let failed = run(&action("echo nope >&2; exit 3"), &dir, &manifest, None);
         assert_eq!(failed.err().as_deref(), Some("nope"));
         std::fs::remove_dir_all(&dir).ok();
     }

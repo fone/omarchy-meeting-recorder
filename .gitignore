@@ -3,3 +3,9 @@
 /media/
 /bench/.cache/
 __pycache__/
+# Never commit local model credentials or meeting artifacts.
+/.env
+/.env.*
+/config.json
+/recordings/
+/Meetings/

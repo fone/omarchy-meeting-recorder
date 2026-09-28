@@ -1,6 +1,6 @@
 # Actions
 
-Actions are your own scripts, one click away on the done page of every meeting. File the transcript in your notes, publish it, mail it to the people who were there, open a ticket: anything you can write as a command.
+Actions are your own scripts, one click away on the done page of every meeting. File the transcript in your notes, publish it, mail it to the people who were there, open a ticket: anything you can write as a command. **This fork also bundles [Summarize to Obsidian](obsidian-summary.md), a different action that sends transcript text to your selected model and saves only the summary.** The older Store transcript example below copies the full transcript to Obsidian.
 
 <p align="center"><img src="../screenshots/actions-menu.webp" alt="Clicking Actions on the done page: the view zooms in on the menu with Store transcript in Obsidian and Publish as public transcript" width="700"></p>
 
@@ -38,6 +38,7 @@ The command runs through `sh -c` in the meeting folder, so `~`, pipes and `VAR=v
 | `MEETING_LANGUAGE` | The transcript language, a code like `en` |
 | `MEETING_SPEAKERS` | The speakers' names, one per line |
 | `MEETING_AUDIO` | The audio file, when there is one |
+| `MEETING_PROGRESS_FILE` | Temporary file for status milestones; write a fraction from 0.0 to 1.0 if your action supports them. Do not send status to the recorder's Unix socket. |
 
 `transcript.md` has a heading with the date and duration, a `## Chapters` list when there are chapters, and then `## Transcript` with one paragraph per turn: `**[01:23] Maya:** What she said.`
 

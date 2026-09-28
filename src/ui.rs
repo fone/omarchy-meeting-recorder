@@ -338,6 +338,8 @@ struct Recorder {
     /// Looked up once: the default agent, if any.
     agent: std::cell::OnceCell<Option<Agent>>,
     generating: Cell<bool>,
+    action_running: Cell<bool>,
+    action_generation: Cell<u64>,
     current_line: Cell<i32>,
 
     mic: Source,
@@ -795,6 +797,8 @@ impl Recorder {
             chapters_spinner,
             agent: std::cell::OnceCell::new(),
             generating: Cell::new(false),
+            action_running: Cell::new(false),
+            action_generation: Cell::new(0),
             current_line: Cell::new(-1),
             mic,
             system,
@@ -1219,22 +1223,98 @@ impl Recorder {
         ) else {
             return;
         };
+        if self.action_running.replace(true) {
+            return; // One action at a time per meeting; never race status or vault writes.
+        }
+        let is_summary = action.name == "Summarize to Obsidian";
+        self.actions_button.set_sensitive(false);
+        let generation = self.action_generation.get().wrapping_add(1);
+        self.action_generation.set(generation);
         // Stays until the action is done, then makes way for how it went.
         let running = adw::Toast::new(&format!("{}…", action.name));
         running.set_use_markup(false);
         running.set_timeout(0);
         self.toasts.add_toast(running.clone());
+        // Show the active action in the bar widget while it runs.
+        {
+            let mut shared = self.shared.lock().unwrap();
+            shared.state = if is_summary {
+                "summarizing"
+            } else {
+                "processing_action"
+            };
+            shared.started_at = ipc::now();
+            shared.progress = 0.0;
+        }
         let before = crate::actions::fingerprint(&dir);
+        // Progress file: the action writes fraction here, we poll it.
+        let progress_file = std::env::temp_dir().join(format!(
+            "mr-progress-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let _ = std::fs::write(&progress_file, "0.0");
         let (tx, rx) = async_channel::bounded(1);
         let name = action.name.clone();
         let folder = dir.clone();
+        let pf = progress_file.clone();
         std::thread::spawn(move || {
-            let _ = tx.send_blocking(crate::actions::run(&action, &folder, &manifest));
+            let _ = tx.send_blocking(crate::actions::run(&action, &folder, &manifest, Some(&pf)));
+            // Clean up progress file when done.
+            let _ = std::fs::remove_file(&pf);
         });
+        // Poll the progress file every 200ms while the action runs.
+        let shared_clone = self.shared.clone();
+        let pf_poll = progress_file.clone();
+        let progress_source =
+            glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+                if let Ok(text) = std::fs::read_to_string(&pf_poll) {
+                    if let Ok(frac) = text.trim().parse::<f64>() {
+                        let mut shared = shared_clone.lock().unwrap();
+                        if shared.state == "summarizing" {
+                            shared.progress = frac.clamp(0.0, 1.0);
+                        }
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
         let this = self.clone();
         glib::spawn_future_local(async move {
             let result = rx.recv().await;
             running.dismiss();
+            progress_source.remove();
+            this.action_running.set(false);
+            this.actions_button.set_sensitive(true);
+            // Keep the outcome visible in the bar for one minute, even after
+            // the short-lived toast goes away. A subsequent action supersedes it.
+            let outcome_state = match (is_summary, matches!(result, Ok(Ok(_)))) {
+                (true, true) => "summary_saved",
+                (true, false) => "summary_failed",
+                (false, true) => "action_done",
+                (false, false) => "action_failed",
+            };
+            {
+                let mut shared = this.shared.lock().unwrap();
+                shared.state = outcome_state;
+                shared.progress = 0.0;
+            }
+            let weak = Rc::downgrade(&this);
+            glib::timeout_add_local_once(Duration::from_secs(60), move || {
+                let Some(recorder) = weak.upgrade() else {
+                    return;
+                };
+                if recorder.action_generation.get() != generation {
+                    return;
+                }
+                let mut shared = recorder.shared.lock().unwrap();
+                if shared.state == outcome_state {
+                    shared.state = "done";
+                    shared.progress = 0.0;
+                }
+            });
             // The action may have edited the meeting: show what is on disk now.
             if crate::actions::fingerprint(&dir) != before {
                 this.reload_meeting(&dir);
@@ -1839,6 +1919,10 @@ impl Recorder {
     }
 
     fn start(self: &Rc<Self>) {
+        if self.action_running.get() {
+            self.toast("Wait for the current action to finish");
+            return;
+        }
         // One recording at a time: the audio sources are shared by all windows.
         if let Some(other) = self.hub.upgrade().and_then(|hub| hub.recording())
             && !Rc::ptr_eq(&other, self)

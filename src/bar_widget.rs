@@ -2,10 +2,11 @@
 //!
 //! The package installs the widget to `/usr/share`, but the Omarchy shell only
 //! loads plugins from `~/.config/omarchy/plugins`, and a package has no
-//! business writing in a home directory. So the app asks, and on a yes links
-//! the widget there and puts it on the right of the bar.
+//! business writing in a home directory. So the app asks, and on a yes copies
+//! the widget there and puts it on the right of the bar. Plugin-folder
+//! symlinks are rejected by the Omarchy validator.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -27,8 +28,8 @@ fn target() -> PathBuf {
 
 /// Offer on Omarchy for a package install until accepted successfully or declined.
 pub fn should_offer() -> bool {
-    // A failed attempt may have already created our symlink. Leave other
-    // installations alone, but allow retrying the link we create in add().
+    // A failed attempt may have left our old package symlink. We can replace
+    // that link with a real directory, but never touch another installation.
     let offer = !settings::bar_widget_offered()
         && glib::find_program_in_path("omarchy").is_some()
         && PathBuf::from(SOURCE).join("manifest.json").is_file()
@@ -70,16 +71,42 @@ fn run(program: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Links the widget into the shell's plugin folder and enables it. Blocking.
+/// Copies the packaged widget into the shell's plugin folder and enables it. Blocking.
 pub fn add() -> Result<(), String> {
     let target = target();
-    if let Some(dir) = target.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    if std::fs::symlink_metadata(&target).is_err() {
-        std::os::unix::fs::symlink(SOURCE, &target).map_err(|e| e.to_string())?;
-    }
+    install_widget_files(Path::new(SOURCE), &target)?;
     enable(run, std::thread::sleep)
+}
+
+fn install_widget_files(source: &Path, target: &Path) -> Result<(), String> {
+    if let Ok(meta) = std::fs::symlink_metadata(target) {
+        if meta.is_dir() {
+            return Ok(()); // Existing user installation: never overwrite it.
+        }
+        if !meta.file_type().is_symlink()
+            || std::fs::read_link(target).ok().as_deref() != Some(source)
+        {
+            return Err(format!("{} already exists", target.display()));
+        }
+    }
+    let parent = target.parent().ok_or("Plugin target has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let staging = parent.join(format!(".{ID}-install-{}", std::process::id()));
+    std::fs::create_dir(&staging).map_err(|e| e.to_string())?;
+    let staged = (|| {
+        for name in ["manifest.json", "StatusWidget.qml"] {
+            std::fs::copy(source.join(name), staging.join(name))
+                .map_err(|e| format!("Cannot install {name}: {e}"))?;
+        }
+        if std::fs::symlink_metadata(target).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            std::fs::remove_file(target).map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(&staging, target).map_err(|e| e.to_string())
+    })();
+    if staged.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    staged
 }
 
 fn enable(
@@ -252,6 +279,50 @@ mod tests {
         assert!(result.unwrap_err().contains("did not discover"));
         assert_eq!(slept, Duration::from_millis(4900));
         assert!(calls.iter().all(|call| call.starts_with("omarchy-shell ")));
+    }
+
+    #[test]
+    fn installer_copies_files_as_a_real_directory_without_overwriting_user_plugins() {
+        let root = std::env::temp_dir().join(format!("mr-widget-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let target = root.join("plugins").join(ID);
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("manifest.json"), "manifest").unwrap();
+        std::fs::write(source.join("StatusWidget.qml"), "widget").unwrap();
+        install_widget_files(&source, &target).unwrap();
+        assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
+        assert_eq!(
+            std::fs::read_to_string(target.join("StatusWidget.qml")).unwrap(),
+            "widget"
+        );
+        std::fs::write(target.join("StatusWidget.qml"), "user version").unwrap();
+        install_widget_files(&source, &target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("StatusWidget.qml")).unwrap(),
+            "user version"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn installer_replaces_only_its_own_legacy_symlink() {
+        let root = std::env::temp_dir().join(format!("mr-widget-link-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let target = root.join("plugins").join(ID);
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(source.join("manifest.json"), "manifest").unwrap();
+        std::fs::write(source.join("StatusWidget.qml"), "widget").unwrap();
+        std::os::unix::fs::symlink(&source, &target).unwrap();
+        install_widget_files(&source, &target).unwrap();
+        assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
+        assert_eq!(
+            std::fs::read_to_string(target.join("manifest.json")).unwrap(),
+            "manifest"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
