@@ -16,6 +16,7 @@ use crate::agent::{self, Agent};
 use crate::animation::TranscribeAnimation;
 use crate::audio::{HISTORY, Source, to_meter};
 use crate::chapters::{self, Chapter};
+use crate::context::{self, LiveNote, MeetingContext};
 use crate::export::{self, Format, export_audio, export_tracks};
 use crate::ipc::{self, SharedStatus, Status};
 use crate::meeting::{self, Manifest};
@@ -25,7 +26,7 @@ use crate::{APP_ID, APP_NAME, settings};
 
 const MIC_COLOR: (f64, f64, f64) = (0.21, 0.52, 0.89);
 const SYSTEM_COLOR: (f64, f64, f64) = (0.90, 0.38, 0.0);
-const FULL_SIZE: (i32, i32) = (480, 700);
+const FULL_SIZE: (i32, i32) = (540, 820);
 const COMPACT_SIZE: (i32, i32) = (300, 84);
 const DONE_SIZE: (i32, i32) = (1100, 760);
 
@@ -295,6 +296,12 @@ struct Recorder {
     compact_action: gio::SimpleAction,
     compact_button: gtk::Button,
     title_row: adw::EntryRow,
+    attendees_row: adw::EntryRow,
+    glossary_row: adw::EntryRow,
+    note_entry: gtk::Entry,
+    notes_group: gtk::Box,
+    note_log: gtk::ListBox,
+    notes: RefCell<Vec<LiveNote>>,
     format_row: adw::ComboRow,
     language_row: adw::ComboRow,
     animation: TranscribeAnimation,
@@ -314,6 +321,8 @@ struct Recorder {
     again_button: gtk::Button,
     done_title_row: adw::EntryRow,
     done_group: adw::PreferencesGroup,
+    done_context: gtk::Label,
+    done_notes_button: gtk::Button,
     /// One name row per speaker, rebuilt for every meeting.
     speaker_rows: RefCell<Vec<adw::EntryRow>>,
     merge_prompt_open: Cell<bool>,
@@ -461,7 +470,48 @@ impl Recorder {
         meters_box.append(&meter_block("You (microphone)", &meters[0]));
         meters_box.append(&meter_block("Computer audio", &meters[1]));
 
+        // Typed roster and vocabulary are context, not detected speaker labels.
+        let context_group = adw::PreferencesGroup::builder()
+            .title("Meeting context")
+            .description("Add people and tricky words before or during the call")
+            .build();
+        let attendees_row = adw::EntryRow::builder()
+            .title("Attendees (comma-separated)")
+            .build();
+        let glossary_row = adw::EntryRow::builder()
+            .title("Terms and names to recognize")
+            .build();
+        context_group.add(&attendees_row);
+        context_group.add(&glossary_row);
+        content.append(&context_group);
         content.append(&meters_box);
+
+        let notes_group = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .build();
+        notes_group.append(
+            &gtk::Label::builder()
+                .label("Live notes · Enter to save · @name then Tab")
+                .xalign(0.0)
+                .css_classes(["dim-label"])
+                .build(),
+        );
+        let note_log = gtk::ListBox::builder()
+            .css_classes(["boxed-list"])
+            .selection_mode(gtk::SelectionMode::None)
+            .build();
+        let note_scroll = gtk::ScrolledWindow::builder()
+            .child(&note_log)
+            .min_content_height(76)
+            .max_content_height(180)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        notes_group.append(&note_scroll);
+        let note_entry = gtk::Entry::builder()
+            .placeholder_text("Type a note, e.g. @Russ will send the specs")
+            .build();
+        content.append(&notes_group);
 
         let status_row = gtk::Box::builder()
             .spacing(10)
@@ -498,13 +548,11 @@ impl Recorder {
             .build();
         buttons.append(&pause_button);
         buttons.append(&button);
-        content.append(&buttons);
         let import_button = gtk::Button::builder()
             .label("Import an audio file, or drop one here")
             .halign(gtk::Align::Center)
             .css_classes(["flat"])
             .build();
-        content.append(&import_button);
 
         // Transcribing: the animation fills the whole window.
         let animation = TranscribeAnimation::new();
@@ -550,6 +598,19 @@ impl Recorder {
             .build();
         done_group.add(&done_title_row);
         left.append(&done_group);
+
+        let done_context = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["dim-label"])
+            .build();
+        left.append(&done_context);
+        let done_notes_button = gtk::Button::builder()
+            .label("View live notes")
+            .css_classes(["flat"])
+            .halign(gtk::Align::Start)
+            .build();
+        left.append(&done_notes_button);
 
         // Chapters: a list to jump through, with the agent's button in the header.
         let chapters_spinner = adw::Spinner::builder().visible(false).build();
@@ -736,7 +797,28 @@ impl Recorder {
             .transition_type(gtk::StackTransitionType::Crossfade)
             .transition_duration(250)
             .build();
-        layout.add_named(&content, Some("record"));
+        let record_scroll = gtk::ScrolledWindow::builder()
+            .child(&content)
+            .vexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        let record_footer = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_start(24)
+            .margin_end(24)
+            .margin_top(8)
+            .margin_bottom(18)
+            .build();
+        record_footer.append(&note_entry);
+        record_footer.append(&buttons);
+        record_footer.append(&import_button);
+        let record_page = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        record_page.append(&record_scroll);
+        record_page.append(&record_footer);
+        layout.add_named(&record_page, Some("record"));
         layout.add_named(animation.widget(), Some("transcribing"));
         layout.add_named(&done, Some("done"));
         layout.add_named(&compact, Some("compact"));
@@ -763,6 +845,12 @@ impl Recorder {
             compact_action,
             compact_button,
             title_row,
+            attendees_row,
+            glossary_row,
+            note_entry,
+            notes_group,
+            note_log,
+            notes: RefCell::default(),
             format_row,
             language_row,
             animation,
@@ -780,6 +868,8 @@ impl Recorder {
             again_button,
             done_title_row,
             done_group,
+            done_context,
+            done_notes_button,
             speaker_rows: RefCell::default(),
             merge_prompt_open: Cell::new(false),
             again_language_row,
@@ -829,6 +919,7 @@ impl Recorder {
             manifest: RefCell::default(),
         });
         recorder.connect_signals(&open_button, &new_button);
+        recorder.show_live_notes();
         recorder.render();
         recorder
     }
@@ -1019,6 +1110,13 @@ impl Recorder {
 
         // The name on the done page drives the same title and folder rename.
         let weak = Rc::downgrade(self);
+        self.done_notes_button.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.show_done_notes();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
         self.done_title_row.connect_changed(move |row| {
             if let Some(r) = weak.upgrade()
                 && r.title_row.text() != row.text()
@@ -1074,6 +1172,35 @@ impl Recorder {
             }
         });
         self.title_row.add_controller(focus);
+
+        for row in [&self.attendees_row, &self.glossary_row] {
+            let weak = Rc::downgrade(self);
+            row.connect_changed(move |_| {
+                if let Some(r) = weak.upgrade()
+                    && !r.loading.get()
+                {
+                    r.save_live_context();
+                }
+            });
+        }
+        let weak = Rc::downgrade(self);
+        self.note_entry.connect_activate(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.commit_live_note();
+            }
+        });
+        let completion = gtk::EventControllerKey::new();
+        let weak = Rc::downgrade(self);
+        completion.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Tab
+                && let Some(r) = weak.upgrade()
+                && r.complete_note_name()
+            {
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        self.note_entry.add_controller(completion);
 
         let weak = Rc::downgrade(self);
         open_button.connect_clicked(move |_| {
@@ -1433,6 +1560,9 @@ impl Recorder {
         self.button.remove_css_class("suggested-action");
         self.button.remove_css_class("destructive-action");
         self.pause_button.set_visible(recording);
+        self.notes_group.set_visible(recording);
+        self.note_entry.set_visible(recording);
+        self.note_entry.set_sensitive(recording);
         self.import_button.set_visible(state == State::Idle);
         self.pause_button
             .set_label(if self.paused.get() { "Resume" } else { "Pause" });
@@ -1465,7 +1595,7 @@ impl Recorder {
                 "Paused. Nothing is recorded until you resume.".to_owned()
             }
             State::Recording => {
-                "Recording. Name, audio file and language can still be changed.".to_owned()
+                "Recording. Add attendees, terms, and live notes as the call unfolds.".to_owned()
             }
             State::Stopping => "Saving the audio…".to_owned(),
             State::Transcribing => "Transcribing the meeting on this computer…".to_owned(),
@@ -1828,6 +1958,7 @@ impl Recorder {
             language: settings::load_language().to_owned(),
         });
         self.title_row.set_text(&note.title);
+        self.load_live_context(context::read(&staging));
         if let Some(i) = Format::ALL.iter().position(|f| *f == note.format) {
             self.format_row.set_selected(i as u32);
         }
@@ -1908,12 +2039,162 @@ impl Recorder {
         });
     }
 
+    fn live_context(&self) -> MeetingContext {
+        MeetingContext {
+            attendees: self.attendees_row.text().trim().to_owned(),
+            glossary: self.glossary_row.text().trim().to_owned(),
+            notes: self.notes.borrow().clone(),
+        }
+    }
+
+    fn save_live_context(&self) {
+        if self.state.get() != State::Recording {
+            return;
+        }
+        if let Some(staging) = self.staging.borrow().as_ref()
+            && let Err(e) = context::write(staging, &self.live_context())
+        {
+            self.toast(&format!("Could not save meeting context: {e}"));
+        }
+    }
+
+    fn show_live_notes(&self) {
+        while let Some(row) = self.note_log.row_at_index(0) {
+            self.note_log.remove(&row);
+        }
+        if self.notes.borrow().is_empty() {
+            self.note_log.append(
+                &gtk::Label::builder()
+                    .label("No notes yet")
+                    .margin_top(12)
+                    .margin_bottom(12)
+                    .css_classes(["dim-label"])
+                    .build(),
+            );
+            return;
+        }
+        for note in self.notes.borrow().iter() {
+            let text = format!("[{}] {}", format_elapsed(note.offset_s), note.text);
+            self.note_log.append(
+                &gtk::Label::builder()
+                    .label(&text)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .margin_start(12)
+                    .margin_end(12)
+                    .margin_top(4)
+                    .margin_bottom(4)
+                    .build(),
+            );
+        }
+    }
+
+    fn load_live_context(&self, context: MeetingContext) {
+        self.loading.set(true);
+        self.attendees_row.set_text(&context.attendees);
+        self.glossary_row.set_text(&context.glossary);
+        *self.notes.borrow_mut() = context.notes;
+        self.note_entry.set_text("");
+        self.loading.set(false);
+        self.show_live_notes();
+    }
+
+    fn update_done_context(&self) {
+        let context = self.live_context();
+        let mut details = Vec::new();
+        if !context.attendees.is_empty() {
+            details.push(format!("Attendees: {}", context.attendees));
+        }
+        if !context.glossary.is_empty() {
+            details.push(format!("Terms: {}", context.glossary));
+        }
+        self.done_context.set_label(&details.join("\n"));
+        self.done_notes_button
+            .set_visible(!context.notes.is_empty());
+        self.done_notes_button
+            .set_label(&format!("View live notes ({})", context.notes.len()));
+    }
+
+    fn show_done_notes(&self) {
+        let text = self
+            .notes
+            .borrow()
+            .iter()
+            .map(|note| format!("[{}] {}", format_elapsed(note.offset_s), note.text))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let view = gtk::TextView::builder()
+            .editable(false)
+            .cursor_visible(false)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .build();
+        view.buffer().set_text(&text);
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&view)
+            .min_content_width(400)
+            .min_content_height(180)
+            .max_content_height(380)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        let dialog = adw::AlertDialog::new(Some("Live notes"), None);
+        dialog.set_extra_child(Some(&scroll));
+        dialog.add_response("close", "Close");
+        dialog.present(Some(&self.window));
+    }
+
+    fn commit_live_note(&self) {
+        if self.state.get() != State::Recording {
+            return;
+        }
+        let text = self.note_entry.text().trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        let Some(staging) = self.staging.borrow().clone() else {
+            self.toast("No active recording to save the note to");
+            return;
+        };
+        let mut context = self.live_context();
+        context.notes.push(LiveNote {
+            offset_s: self.elapsed(),
+            text,
+        });
+        // Do not clear the composer or show a note before the durable write.
+        match context::write(&staging, &context) {
+            Ok(()) => {
+                *self.notes.borrow_mut() = context.notes;
+                self.note_entry.set_text("");
+                self.show_live_notes();
+            }
+            Err(e) => self.toast(&format!("Could not save the note: {e}")),
+        }
+    }
+
+    fn complete_note_name(&self) -> bool {
+        let text = self.note_entry.text().to_string();
+        if self.note_entry.position() as usize != text.chars().count() {
+            return false;
+        }
+        let Some(at) = text.rfind('@') else {
+            return false;
+        };
+        let prefix = &text[at + 1..];
+        let Some(name) = context::complete_name(&self.attendees_row.text(), prefix) else {
+            return false;
+        };
+        self.note_entry
+            .set_text(&format!("{}@{name} ", &text[..at]));
+        self.note_entry.set_position(-1);
+        true
+    }
+
     /// Back to the recording page, ready for the next meeting.
     fn ready(&self) {
         self.player.unload();
         *self.result_dir.borrow_mut() = None;
         *self.manifest.borrow_mut() = None;
         self.title_row.set_text("");
+        self.load_live_context(MeetingContext::default());
         self.timer.set_label("00:00");
         self.compact_timer.set_label("00:00");
         self.set_state(State::Idle);
@@ -1948,6 +2229,7 @@ impl Recorder {
             .join(APP_NAME)
             .join(started_at.to_string());
         if let Err(e) = std::fs::create_dir_all(&staging)
+            .and_then(|_| context::write(&staging, &self.live_context()))
             .and_then(|_| self.mic.start_recording(&staging.join("mic.raw")))
             .and_then(|_| self.system.start_recording(&staging.join("system.raw")))
         {
@@ -2032,6 +2314,10 @@ impl Recorder {
                 chapters_by: None,
             };
             let _ = meeting::write(&out, &manifest);
+            let context_saved = context::copy(&staging, &out);
+            if let Err(e) = &context_saved {
+                this.toast(&format!("Could not save meeting context: {e}"));
+            }
             *this.manifest.borrow_mut() = Some(manifest);
             *this.result_dir.borrow_mut() = Some(out);
 
@@ -2039,7 +2325,7 @@ impl Recorder {
                 .run_transcription(Tracks::Raw(staging.clone()), language)
                 .await;
             // The kept tracks are enough to transcribe again; the raw files can go.
-            if saved == (true, true) {
+            if saved == (true, true) && context_saved.is_ok() {
                 let _ = std::fs::remove_dir_all(&staging);
             }
             this.hold_animation(&result).await;
@@ -2070,10 +2356,13 @@ impl Recorder {
         *self.abort.borrow_mut() = Some(abort.clone());
         let (events_tx, events_rx) = async_channel::unbounded::<Event>();
         let (done_tx, done_rx) = async_channel::bounded(1);
+        let glossary = context::read(&out).transcription_terms();
         std::thread::spawn(move || {
             let result = match tracks {
                 Tracks::Single(path, speakers) => transcribe::load_track(&path).and_then(|track| {
-                    transcribe::transcribe_single(&track, language, speakers, &events_tx, &abort)
+                    transcribe::transcribe_single(
+                        &track, language, speakers, &glossary, &events_tx, &abort,
+                    )
                 }),
                 Tracks::Raw(dir) | Tracks::Kept(dir) => {
                     let (mic_path, computer_path) = if dir.join("mic.raw").exists() {
@@ -2083,7 +2372,9 @@ impl Recorder {
                     };
                     transcribe::load_track(&mic_path).and_then(|mic| {
                         let computer = transcribe::load_track(&computer_path)?;
-                        transcribe::transcribe(&mic, &computer, language, &events_tx, &abort)
+                        transcribe::transcribe(
+                            &mic, &computer, language, &glossary, &events_tx, &abort,
+                        )
                     })
                 }
             };
@@ -2225,6 +2516,7 @@ impl Recorder {
 
     fn finished(self: &Rc<Self>, audio_ok: bool, transcript: Result<(), String>) {
         self.done_title_row.set_text(&self.title_row.text());
+        self.update_done_context();
         self.set_state(State::Done);
         // Follow a name that was edited while the transcription ran.
         self.apply_title();
@@ -2325,6 +2617,8 @@ impl Recorder {
         self.started_at.set(manifest.started_at);
         self.title_row.set_text(&manifest.title);
         self.done_title_row.set_text(&manifest.title);
+        self.load_live_context(context::read(&dir));
+        self.update_done_context();
         *self.manifest.borrow_mut() = Some(manifest);
         *self.result_dir.borrow_mut() = Some(dir.clone());
         self.set_state(State::Done);

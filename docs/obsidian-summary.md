@@ -102,6 +102,49 @@ cargo test --quiet
 
 The unit test uses a fake model and a temporary vault; it does not check your API credential. A full real-provider check requires your own deliberate action click.
 
+
+## 5. Typed meeting context (context.json)
+
+Before starting, enter a comma-separated **Attendees** roster and any tricky
+names or technical terms under **Meeting context**. You can edit both while
+recording. Terms and attendee names seed Whisper's initial prompt when the
+recording is transcribed. During the meeting, type in the fixed **Live notes**
+field: `@Ru` then Tab completes a name from your typed roster; Enter saves a
+note with its recording timestamp. Saved notes are visible in the meeting
+folder and via **View live notes** on the finished screen. These fields are
+per-meeting and never inferred from detected speaker labels.
+
+When a `context.json` sidecar exists in the meeting folder, the action reads
+it automatically and passes the typed context into the model prompt as
+separate XML blocks:
+
+| Block | Source | Purpose |
+|---|---|---|
+| `<attendees>` | Typed roster | Ground-truth attendance — used for name spelling, people field |
+| `<glossary>` | Typed terms | Proper-noun corrections for transcription errors |
+| `<user_notes>` | Timestamped live notes | Authoritative for item existence and ownership |
+| `<transcript>` | Always present | Machine speech transcription (least reliable for names) |
+
+The `context.json` schema (version 1):
+
+```json
+{
+  "version": 1,
+  "attendees": "Adam, Russ",
+  "glossary": "FileBound, QRadar",
+  "notes": [
+    {"offset_s": 12, "text": "@Russ follow up"}
+  ]
+}
+```
+
+**Key rules:**
+
+- **Typed roster is attendance truth.** Detected speaker labels (`MEETING_SPEAKERS`) are never treated as attendees — voice detection is not ground truth for who was present.
+- **Typed title takes precedence.** If `MEETING_TITLE` is not blank or auto-generated (`Meeting HH:MM`), it is used as the note title instead of the model-generated title.
+- **Live notes appear in the Obsidian note.** Timestamped notes are rendered under `## Live Notes`; raw transcript lines are never copied into the vault note.
+- **Legacy fallback.** Without `context.json`, the action behaves as before: no glossary/user_notes blocks, speakers used for the people field with generic labels filtered out.
+
 ## Troubleshooting
 
 | Symptom | Check |

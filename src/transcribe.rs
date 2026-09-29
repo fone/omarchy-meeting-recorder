@@ -530,6 +530,7 @@ pub fn transcribe(
     mic: &[f32],
     computer: &[f32],
     language: &str,
+    glossary: &str,
     events: &Events,
     abort: &Abort,
 ) -> Result<Transcript, String> {
@@ -593,6 +594,7 @@ pub fn transcribe(
             regions,
             speakers,
             &language,
+            glossary,
             (done, done + share),
             false,
             events,
@@ -728,6 +730,7 @@ pub fn transcribe_single(
     track: &[f32],
     language: &str,
     speakers: Option<usize>,
+    glossary: &str,
     events: &Events,
     abort: &Abort,
 ) -> Result<Transcript, String> {
@@ -762,6 +765,7 @@ pub fn transcribe_single(
         &regions,
         &speakers,
         language,
+        glossary,
         duration_secs,
         events,
         abort,
@@ -769,11 +773,13 @@ pub fn transcribe_single(
 }
 
 /// The shared part: whisper over the stretches with sound, then the lines.
+#[allow(clippy::too_many_arguments)]
 fn whisper_pass(
     mixed: &[f32],
     regions: &[Region],
     speakers: &Speakers,
     language: &str,
+    glossary: &str,
     duration_secs: i64,
     events: &Events,
     abort: &Abort,
@@ -785,6 +791,7 @@ fn whisper_pass(
         regions,
         speakers,
         language,
+        glossary,
         (0.0, 1.0),
         true,
         events,
@@ -834,6 +841,7 @@ fn side_pass(
     regions: &[Region],
     speakers: &Speakers,
     language: &str,
+    glossary: &str,
     progress: (f64, f64),
     paragraphs: bool,
     events: &Events,
@@ -841,8 +849,9 @@ fn side_pass(
 ) -> Result<(Vec<Segment>, Option<String>), String> {
     let glued = Glued::new(track, regions);
     emit(events, Event::Stage("Transcribing".into()));
-    let (words, detected) =
-        run_whisper(context, &glued, speakers, language, progress, events, abort)?;
+    let (words, detected) = run_whisper(
+        context, &glued, speakers, language, glossary, progress, events, abort,
+    )?;
     Ok((
         phrases(&words, &glued, speakers, track, paragraphs),
         detected,
@@ -860,11 +869,13 @@ struct Word {
     segment: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_whisper(
     context: &WhisperContext,
     glued: &Glued,
     speakers: &Speakers,
     language: &str,
+    glossary: &str,
     progress: (f64, f64),
     events: &Events,
     abort: &Abort,
@@ -874,6 +885,11 @@ fn run_whisper(
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     params.set_n_threads(threads.min(16) as i32);
     params.set_language(Some(language));
+    // Glossary as initial prompt, bounded to avoid hallucination.
+    let prompt = crate::context::prompt_glossary(glossary);
+    if !prompt.is_empty() {
+        params.set_initial_prompt(&prompt);
+    }
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
@@ -1260,6 +1276,7 @@ pub fn to_markdown(title: &str, date: &str, transcript: &Transcript) -> String {
 pub fn cli(args: &[String]) -> glib::ExitCode {
     let mut files = Vec::new();
     let mut language = "auto".to_owned();
+    let mut glossary = String::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1271,6 +1288,10 @@ pub fn cli(args: &[String]) -> glib::ExitCode {
                 Some(name) => crate::models::set_override(name),
                 None => return usage(),
             },
+            "--glossary" | "-g" => match iter.next() {
+                Some(terms) => glossary = terms.clone(),
+                None => return usage(),
+            },
             _ => files.push(PathBuf::from(arg)),
         }
     }
@@ -1280,7 +1301,7 @@ pub fn cli(args: &[String]) -> glib::ExitCode {
     run_cli(|events, abort| {
         let mic = load_track(mic_path)?;
         let computer = load_track(computer_path)?;
-        transcribe(&mic, &computer, &language, events, abort)
+        transcribe(&mic, &computer, &language, &glossary, events, abort)
     })
 }
 
@@ -1289,6 +1310,7 @@ pub fn cli_file(args: &[String]) -> glib::ExitCode {
     let mut files = Vec::new();
     let mut language = "auto".to_owned();
     let mut speakers = None;
+    let mut glossary = String::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1304,6 +1326,10 @@ pub fn cli_file(args: &[String]) -> glib::ExitCode {
                 Some(n) if n > 0 => speakers = Some(n),
                 _ => return usage(),
             },
+            "--glossary" | "-g" => match iter.next() {
+                Some(terms) => glossary = terms.clone(),
+                None => return usage(),
+            },
             _ => files.push(PathBuf::from(arg)),
         }
     }
@@ -1312,7 +1338,7 @@ pub fn cli_file(args: &[String]) -> glib::ExitCode {
     };
     run_cli(|events, abort| {
         let track = load_track(path)?;
-        transcribe_single(&track, &language, speakers, events, abort)
+        transcribe_single(&track, &language, speakers, &glossary, events, abort)
     })
 }
 
@@ -1367,10 +1393,10 @@ fn run_cli(work: impl FnOnce(&Events, &Abort) -> Result<Transcript, String>) -> 
 
 fn usage() -> glib::ExitCode {
     eprintln!(
-        "Usage: {APP_NAME} transcribe <mic> <computer> [--language auto|en|nl|...] [--model name]"
+        "Usage: {APP_NAME} transcribe <mic> <computer> [--language auto|en|nl|...] [--model name] [--glossary terms]"
     );
     eprintln!(
-        "       {APP_NAME} transcribe-file <audio> [--speakers N] [--language auto|en|nl|...] [--model name]"
+        "       {APP_NAME} transcribe-file <audio> [--speakers N] [--language auto|en|nl|...] [--model name] [--glossary terms]"
     );
     glib::ExitCode::from(2)
 }
