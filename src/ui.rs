@@ -316,6 +316,7 @@ struct Recorder {
     done_group: adw::PreferencesGroup,
     /// One name row per speaker, rebuilt for every meeting.
     speaker_rows: RefCell<Vec<adw::EntryRow>>,
+    merge_prompt_open: Cell<bool>,
     again_language_row: adw::ComboRow,
     done_icon: gtk::Image,
     done_heading: gtk::Label,
@@ -780,6 +781,7 @@ impl Recorder {
             done_title_row,
             done_group,
             speaker_rows: RefCell::default(),
+            merge_prompt_open: Cell::new(false),
             again_language_row,
             done_icon,
             done_heading,
@@ -1271,12 +1273,12 @@ impl Recorder {
         let pf_poll = progress_file.clone();
         let progress_source =
             glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-                if let Ok(text) = std::fs::read_to_string(&pf_poll) {
-                    if let Ok(frac) = text.trim().parse::<f64>() {
-                        let mut shared = shared_clone.lock().unwrap();
-                        if shared.state == "summarizing" {
-                            shared.progress = frac.clamp(0.0, 1.0);
-                        }
+                if let Ok(text) = std::fs::read_to_string(&pf_poll)
+                    && let Ok(frac) = text.trim().parse::<f64>()
+                {
+                    let mut shared = shared_clone.lock().unwrap();
+                    if shared.state == "summarizing" {
+                        shared.progress = frac.clamp(0.0, 1.0);
                     }
                 }
                 glib::ControlFlow::Continue
@@ -2886,14 +2888,10 @@ impl Recorder {
             .as_ref()
             .map(|m| m.speakers.clone())
             .unwrap_or_default();
-        if speakers.len() < 2 {
+        let Some(other) = meeting::next_distinct_speaker(&speakers, who) else {
             return;
-        }
-        let next = speakers
-            .iter()
-            .position(|s| s == who)
-            .map_or(0, |i| (i + 1) % speakers.len());
-        let other = speakers[next].clone();
+        };
+        let other = other.to_owned();
         let sources = sources.to_vec();
         self.rewrite_transcript(move |lines| {
             for index in sources {
@@ -3011,6 +3009,10 @@ impl Recorder {
     /// Renames the speakers in transcript.md and the manifest. Your own name is
     /// also remembered for the next recordings.
     fn apply_speakers(self: &Rc<Self>) {
+        self.apply_speakers_with_merge(false);
+    }
+
+    fn apply_speakers_with_merge(self: &Rc<Self>, merge_confirmed: bool) {
         if self.state.get() != State::Done {
             return;
         }
@@ -3021,7 +3023,7 @@ impl Recorder {
             return;
         };
         let labels = manifest.default_labels();
-        let names: Vec<String> = self
+        let mut names: Vec<String> = self
             .speaker_rows
             .borrow()
             .iter()
@@ -3038,38 +3040,74 @@ impl Recorder {
                 }
             })
             .collect();
-        if names.is_empty() || names == manifest.speakers {
-            return;
-        }
-        let mut unique = names.clone();
-        unique.sort();
-        unique.dedup();
-        if unique.len() != names.len() {
-            self.toast("Every speaker needs a different name");
+        if let Err(message) = meeting::complete_merged_renames(&manifest.speakers, &mut names) {
+            self.toast(message);
             self.show_speakers();
             return;
         }
-        let renames: Vec<(String, String)> = manifest
-            .speakers
-            .iter()
-            .cloned()
-            .zip(names.iter().cloned())
-            .filter(|(from, to)| from != to)
-            .collect();
+        if names.is_empty() || names == manifest.speakers {
+            return;
+        }
+        let renames = match meeting::speaker_renames(&manifest.speakers, &names) {
+            Ok(renames) => renames,
+            Err(message) => {
+                self.toast(message);
+                self.show_speakers();
+                return;
+            }
+        };
+        if meeting::introduces_merge(&manifest.speakers, &names) && !merge_confirmed {
+            if self.merge_prompt_open.replace(true) {
+                return;
+            }
+            let dialog = adw::AlertDialog::new(
+                Some("Merge speakers?"),
+                Some(
+                    "These detected voices will appear as one person in the transcript. You can rename them together later, but to separate them again you must transcribe again.",
+                ),
+            );
+            dialog.add_response("cancel", "Keep separate");
+            dialog.add_response("merge", "Merge speakers");
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let this = self.clone();
+            dialog.connect_response(None, move |_, response| {
+                this.merge_prompt_open.set(false);
+                if response == "merge" {
+                    this.apply_speakers_with_merge(true);
+                } else {
+                    this.show_speakers();
+                }
+            });
+            dialog.present(Some(&self.window));
+            return;
+        }
         let transcript = dir.join("transcript.md");
-        if let Ok(text) = std::fs::read_to_string(&transcript) {
-            let _ = std::fs::write(&transcript, meeting::relabel_all(&text, &renames));
+        let before = match std::fs::read_to_string(&transcript) {
+            Ok(text) => text,
+            Err(e) => {
+                self.toast(&format!("Could not read the transcript: {e}"));
+                return;
+            }
+        };
+        let updated = meeting::relabel_all(&before, &renames);
+        if let Err(e) = std::fs::write(&transcript, &updated) {
+            self.toast(&format!("Could not save the transcript: {e}"));
+            return;
         }
+        let mut updated_manifest = manifest.clone();
+        updated_manifest.speakers = names.clone();
+        if let Err(e) = meeting::write(&dir, &updated_manifest) {
+            let _ = std::fs::write(&transcript, &before);
+            self.toast(&format!("Could not save the speaker names: {e}"));
+            return;
+        }
+        *self.manifest.borrow_mut() = Some(updated_manifest);
         let you_changed = manifest.imported.is_none() && names.first() != manifest.speakers.first();
-        if let Some(m) = self.manifest.borrow_mut().as_mut() {
-            m.speakers = names.clone();
-            let _ = meeting::write(&dir, m);
-        }
         if you_changed && let Some(you) = names.first() {
             settings::save_your_name(you);
         }
-        let text = std::fs::read_to_string(&transcript).ok();
-        self.redraw_transcript(text.as_deref().unwrap_or(""));
+        self.redraw_transcript(&updated);
         self.toast("Saved");
     }
 

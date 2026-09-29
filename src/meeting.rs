@@ -155,6 +155,87 @@ pub fn side_of(label: &str) -> Option<(&'static str, usize)> {
     None
 }
 
+/// Editing either row of an already-merged identity renames the whole group.
+/// If multiple rows were changed to conflicting values, do not guess.
+pub fn complete_merged_renames(old: &[String], names: &mut [String]) -> Result<(), &'static str> {
+    if old.len() != names.len() {
+        return Err("Speaker list changed while editing");
+    }
+    for i in 0..old.len() {
+        let changes: Vec<&str> = old
+            .iter()
+            .zip(names.iter())
+            .filter(|(source, target)| *source == &old[i] && *target != &old[i])
+            .map(|(_, target)| target.as_str())
+            .collect();
+        if let Some(first) = changes.first() {
+            if changes.iter().any(|name| name != first) {
+                return Err(
+                    "Merged speakers must be renamed together; transcribe again to separate them",
+                );
+            }
+            let target = (*first).to_owned();
+            for (source, name) in old.iter().zip(names.iter_mut()) {
+                if source == &old[i] {
+                    *name = target.clone();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build unambiguous transcript renames. A merged name has lost its per-line
+/// source identity, so it can only be renamed as a group, never split by editing
+/// one of its rows. Duplicate source names must be mapped only once.
+pub fn speaker_renames(
+    old: &[String],
+    names: &[String],
+) -> Result<Vec<(String, String)>, &'static str> {
+    if old.len() != names.len() {
+        return Err("Speaker list changed while editing");
+    }
+    let mut renames = Vec::<(String, String)>::new();
+    for (from, to) in old.iter().zip(names) {
+        if let Some((_, previous)) = renames.iter().find(|(name, _)| name == from) {
+            if previous != to {
+                return Err(
+                    "Merged speakers must be renamed together; transcribe again to separate them",
+                );
+            }
+        } else {
+            renames.push((from.clone(), to.clone()));
+        }
+    }
+    Ok(renames
+        .into_iter()
+        .filter(|(from, to)| from != to)
+        .collect())
+}
+
+/// A confirmation is needed only when two previously distinct identities
+/// would be merged, not when an already-merged group is renamed as one.
+pub fn introduces_merge(old: &[String], names: &[String]) -> bool {
+    names.iter().enumerate().any(|(i, name)| {
+        names
+            .iter()
+            .enumerate()
+            .any(|(j, other)| i != j && name == other && old.get(i) != old.get(j))
+    })
+}
+
+/// The next different person for the transcript's Next speaker action.
+pub fn next_distinct_speaker<'a>(speakers: &'a [String], who: &str) -> Option<&'a str> {
+    let start = speakers.iter().position(|name| name == who)?;
+    speakers
+        .iter()
+        .cycle()
+        .skip(start + 1)
+        .take(speakers.len().saturating_sub(1))
+        .find(|name| name.as_str() != who)
+        .map(String::as_str)
+}
+
 /// Renames several speakers at once, safe when names swap places: every old
 /// name goes through a placeholder first.
 pub fn relabel_all(markdown: &str, renames: &[(String, String)]) -> String {
@@ -283,7 +364,95 @@ fn from_folder(dir: &Path) -> Option<Manifest> {
 
 #[cfg(test)]
 mod tests {
-    use super::{relabel, side_of};
+    use super::{next_distinct_speaker, relabel, side_of, speaker_renames};
+
+    #[test]
+    fn merging_two_detected_voices_into_one_person() {
+        let old = vec!["Adam".into(), "Room 2".into(), "Russ".into()];
+        let names = vec!["Adam".into(), "Adam".into(), "Russ".into()];
+        let renames = speaker_renames(&old, &names).unwrap();
+        assert_eq!(renames, vec![("Room 2".into(), "Adam".into())]);
+        let text = "**[00:01] Adam:** Hi.\n**[00:02] Room 2:** Again.\n";
+        assert_eq!(
+            super::relabel_all(text, &renames),
+            "**[00:01] Adam:** Hi.\n**[00:02] Adam:** Again.\n"
+        );
+    }
+
+    #[test]
+    fn renaming_a_merged_identity_updates_every_matching_row() {
+        let old = vec!["Adam".into(), "Adam".into(), "Russ".into()];
+        let names = vec!["Alex".into(), "Alex".into(), "Russ".into()];
+        assert_eq!(
+            speaker_renames(&old, &names).unwrap(),
+            vec![("Adam".into(), "Alex".into())]
+        );
+        assert!(speaker_renames(&old, &["Alex".into(), "Adam".into(), "Russ".into()]).is_err());
+    }
+
+    #[test]
+    fn editing_one_row_renames_the_whole_merged_identity() {
+        let old = vec!["Adam".into(), "Adam".into(), "Russ".into()];
+        let mut names = vec!["Alex".into(), "Adam".into(), "Russ".into()];
+        super::complete_merged_renames(&old, &mut names).unwrap();
+        assert_eq!(names, vec!["Alex", "Alex", "Russ"]);
+        assert!(speaker_renames(&old, &names).is_ok());
+        let mut conflicting = vec!["Alex".into(), "Pat".into(), "Russ".into()];
+        assert!(super::complete_merged_renames(&old, &mut conflicting).is_err());
+    }
+
+    #[test]
+    fn confirmation_only_for_new_merge_not_renaming_existing_group() {
+        assert!(super::introduces_merge(
+            &["Adam".into(), "Room 2".into()],
+            &["Adam".into(), "Adam".into()]
+        ));
+        assert!(!super::introduces_merge(
+            &["Adam".into(), "Adam".into()],
+            &["Alex".into(), "Alex".into()]
+        ));
+        assert!(super::introduces_merge(
+            &["Adam".into(), "Adam".into(), "Russ".into()],
+            &["Russ".into(), "Russ".into(), "Russ".into()]
+        ));
+    }
+
+    #[test]
+    fn merged_names_keep_distinct_diarization_labels_on_reload() {
+        let manifest = super::Manifest {
+            title: "AI Meeting".into(),
+            started_at: 0,
+            duration_secs: 100,
+            format: crate::export::Format::Mono,
+            language: "en".into(),
+            speakers: vec!["Adam".into(), "Adam".into(), "Russ".into()],
+            labels: vec!["You 1".into(), "You 2".into(), "Remote".into()],
+            imported: None,
+            speaker_count: None,
+            model: None,
+            chapters: vec![],
+            chapters_by: None,
+        };
+        let restored = super::Manifest::from_json(&manifest.to_json()).unwrap();
+        assert_eq!(restored.default_labels(), manifest.labels);
+        assert_eq!(restored.speakers, manifest.speakers);
+        let renames = speaker_renames(&restored.default_labels(), &restored.speakers).unwrap();
+        assert_eq!(
+            super::relabel_all(
+                "**[00:01] You 1:** Hi.\n**[00:02] You 2:** Again.\n",
+                &renames
+            ),
+            "**[00:01] Adam:** Hi.\n**[00:02] Adam:** Again.\n"
+        );
+    }
+
+    #[test]
+    fn next_speaker_skips_duplicate_names() {
+        let names = vec!["Adam".into(), "Adam".into(), "Russ".into()];
+        assert_eq!(next_distinct_speaker(&names, "Adam"), Some("Russ"));
+        assert_eq!(next_distinct_speaker(&names, "Russ"), Some("Adam"));
+        assert_eq!(next_distinct_speaker(&names[..2], "Adam"), None);
+    }
 
     #[test]
     fn labels_tell_the_side_and_number() {
