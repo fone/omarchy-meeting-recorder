@@ -160,6 +160,32 @@ pub fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::copy(&src, to.join(CONTEXT_FILE)).map(|_| ())
 }
 
+/// Persist an edited or removed note before returning the new context.
+/// `Some(text)` edits without changing its timestamp; `None` removes it.
+/// Invalid indices or blank edits return `Ok(None)` without touching disk.
+pub fn change_note(
+    dir: &Path,
+    context: &MeetingContext,
+    index: usize,
+    text: Option<&str>,
+) -> std::io::Result<Option<MeetingContext>> {
+    let Some(previous) = context.notes.get(index) else {
+        return Ok(None);
+    };
+    let mut updated = context.clone();
+    if let Some(text) = text {
+        let text = text.trim();
+        if text.is_empty() || previous.text == text {
+            return Ok(None);
+        }
+        updated.notes[index].text = text.to_owned();
+    } else {
+        updated.notes.remove(index);
+    }
+    write(dir, &updated)?;
+    Ok(Some(updated))
+}
+
 /// Complete an `@name` prefix against the typed attendee roster.
 ///
 /// `attendees` is a comma-separated list. Returns the first name whose
@@ -175,6 +201,45 @@ pub fn complete_name(attendees: &str, prefix: &str) -> Option<String> {
         .map(str::trim)
         .find(|name| name.to_lowercase().starts_with(&prefix) && !name.is_empty())
         .map(str::to_owned)
+}
+
+/// A speaker-name field accepts `@prefix` as a temporary completion command,
+/// then stores only the canonical roster name (without `@`).
+pub fn complete_speaker_name(attendees: &str, typed: &str) -> Option<String> {
+    complete_name(attendees, typed.trim().strip_prefix('@')?)
+}
+
+/// A chronological transcript-timeline item. Indices refer to their source
+/// collections; notes never become transcript.md lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineItem {
+    Chapter(usize),
+    Paragraph(usize),
+    Note(usize),
+}
+
+pub fn timeline_order(
+    paragraphs_ms: &[i64],
+    chapters_ms: &[i64],
+    notes: &[LiveNote],
+) -> Vec<TimelineItem> {
+    let mut entries: Vec<(i64, u8, usize, TimelineItem)> = Vec::new();
+    for (index, &ms) in chapters_ms.iter().enumerate() {
+        entries.push((ms, 0, index, TimelineItem::Chapter(index)));
+    }
+    for (index, &ms) in paragraphs_ms.iter().enumerate() {
+        entries.push((ms, 1, index, TimelineItem::Paragraph(index)));
+    }
+    for (index, note) in notes.iter().enumerate() {
+        entries.push((
+            note.offset_s.max(0).saturating_mul(1000),
+            2,
+            index,
+            TimelineItem::Note(index),
+        ));
+    }
+    entries.sort_by_key(|&(ms, priority, index, _)| (ms, priority, index));
+    entries.into_iter().map(|(_, _, _, item)| item).collect()
 }
 
 /// Format glossary terms for whisper's initial prompt.
@@ -315,6 +380,92 @@ mod tests {
     }
 
     #[test]
+    fn edit_and_delete_note_persist_without_touching_transcript() {
+        let dir = tmpdir("change_note_round_trip");
+        let original = MeetingContext {
+            notes: vec![
+                LiveNote {
+                    offset_s: 42,
+                    text: "draft".into(),
+                },
+                LiveNote {
+                    offset_s: 42,
+                    text: "second".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        write(&dir, &original).unwrap();
+        fs::write(dir.join("transcript.md"), "original transcript").unwrap();
+        let edited = change_note(&dir, &original, 0, Some("  final  "))
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.notes[0].text, "draft");
+        assert_eq!(edited.notes[0].text, "final");
+        assert_eq!(edited.notes[0].offset_s, 42);
+        assert_eq!(read(&dir), edited);
+        assert!(change_note(&dir, &edited, 0, Some("  ")).unwrap().is_none());
+        assert!(change_note(&dir, &edited, 8, None).unwrap().is_none());
+        let removed = change_note(&dir, &edited, 0, None).unwrap().unwrap();
+        assert_eq!(removed.notes.len(), 1);
+        assert_eq!(removed.notes[0].text, "second");
+        assert_eq!(read(&dir), removed);
+        assert_eq!(
+            fs::read_to_string(dir.join("transcript.md")).unwrap(),
+            "original transcript"
+        );
+    }
+
+    #[test]
+    fn note_write_failure_preserves_original() {
+        let dir = tmpdir("change_note_failure");
+        let original = MeetingContext {
+            notes: vec![LiveNote {
+                offset_s: 7,
+                text: "keep".into(),
+            }],
+            ..Default::default()
+        };
+        write(&dir, &original).unwrap();
+        let not_a_directory = dir.join("not-a-directory");
+        fs::write(&not_a_directory, "occupied").unwrap();
+        assert!(change_note(&not_a_directory, &original, 0, None).is_err());
+        assert_eq!(read(&dir), original);
+        assert_eq!(original.notes[0].text, "keep");
+    }
+
+    #[test]
+    fn timeline_interleaves_notes_chapters_and_speech_stably() {
+        let notes = vec![
+            LiveNote {
+                offset_s: 90,
+                text: "during long turn".into(),
+            },
+            LiveNote {
+                offset_s: 0,
+                text: "at start".into(),
+            },
+            LiveNote {
+                offset_s: 90,
+                text: "same second".into(),
+            },
+        ];
+        assert_eq!(
+            timeline_order(&[0, 31_000, 95_000], &[30_000], &notes),
+            vec![
+                TimelineItem::Paragraph(0),
+                TimelineItem::Note(1),
+                TimelineItem::Chapter(0),
+                TimelineItem::Paragraph(1),
+                TimelineItem::Note(0),
+                TimelineItem::Note(2),
+                TimelineItem::Paragraph(2),
+            ]
+        );
+        assert_eq!(timeline_order(&[], &[], &notes).len(), 3);
+    }
+
+    #[test]
     fn complete_name_basic() {
         let roster = "Adam, Russ, Pat";
         assert_eq!(complete_name(roster, "A"), Some("Adam".into()));
@@ -353,6 +504,17 @@ mod tests {
         };
         assert_eq!(ctx.transcription_terms(), "QRadar, QNAP, Adam, Russ");
         assert_eq!(MeetingContext::default().transcription_terms(), "");
+    }
+
+    #[test]
+    fn speaker_name_completion_is_roster_only_and_strips_marker() {
+        assert_eq!(
+            complete_speaker_name("Test, Mr. Testy, Network Chuck", "@Network Ch"),
+            Some("Network Chuck".into())
+        );
+        assert_eq!(complete_speaker_name("Adam", "Adam"), None);
+        assert_eq!(complete_speaker_name("Adam", "@Unknown"), None);
+        assert_eq!(complete_speaker_name("Adam", "@"), None);
     }
 
     #[test]
